@@ -1,0 +1,94 @@
+system:
+  input_dir: "input"
+  output_dir: "output"
+  default_file: "chatbot test cases.xlsx"
+  default_sheet: "genral user test cases"
+
+groq:
+  model: "openai/gpt-oss-120b"
+  fallback_model: "qwen/qwen3.8-27b"
+  temperature: 0.1
+  max_tokens: 1024
+
+api:
+  chat_endpoint: "https://aiapi.techfeatures.ai/api/v1/chat/messages"
+  origin: "https://techfeatures.ai"
+  referer: "https://techfeatures.ai/home"
+  timeout_seconds: 120
+  max_retries: 1
+  retry_delay_seconds: 5
+
+scoring:
+  scale: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  verdicts:
+    pass_threshold: 8
+    partial_threshold: 5
+    fail_threshold: 4
+
+column_synonyms:
+  test_id:
+    - "test id"
+    - "tc id"
+    - "scenario id"
+    - "s.no"
+    - "id"
+  feature:
+    - "feature"
+    - "module"
+    - "component"
+  test_type:
+    - "test type"
+    - "type"
+    - "category"
+  description:
+    - "test description"
+    - "description"
+    - "summary"
+  precondition:
+    - "precondition"
+    - "preconditions"
+    - "prerequisites"
+  steps:
+    - "test steps"
+    - "steps"
+    - "procedure"
+  input_data:
+    - "test data"
+    - "query"
+    - "user message"
+    - "input"
+    - "prompt"
+    - "user query"
+    - "question"
+  expected:
+    - "expected result"
+    - "expected output"
+    - "expected response"
+    - "expected behavior"
+  remark:
+    - "remark"
+    - "notes"
+    - "comments"
+    - "tester notes"
+  test_status:
+    - "test status"
+    - "status"
+  test_result:
+    - "test result"
+    - "result"
+    - "verdict"
+  score:
+    - "score"
+    - "score (1-10)"
+    - "score (1-5)"
+    - "match score"
+  actual_output:
+    - "actual output"
+    - "actual response"
+    - "bot response"
+  test_notes:
+    - "test notes"
+    - "ai evaluation notes"
+    - "ai notes"
+    - "suggestions / doubts"
+
