@@ -73,16 +73,20 @@ class ExcelWriter:
         notes_col = col_map.get("notes", 14)
 
         # Set clean headers if not already set
-        ws.cell(header_row, actual_col, "Actual Output").font = FONT_BOLD
-        ws.cell(header_row, score_col, "Score (1-10)").font = FONT_BOLD
-        ws.cell(header_row, notes_col, "Test Notes / AI Feedback").font = FONT_BOLD
+        if not ws.cell(header_row, actual_col).value:
+            ws.cell(header_row, actual_col, "Actual Output").font = FONT_BOLD
+        if not ws.cell(header_row, score_col).value:
+            ws.cell(header_row, score_col, "Score (1-10)").font = FONT_BOLD
+        if not ws.cell(header_row, notes_col).value:
+            ws.cell(header_row, notes_col, "Test Notes / AI Feedback").font = FONT_BOLD
 
         # Populate evaluated test cases
         for res in test_results:
             r = res["row_idx"]
-            score = res.get("score", 1)
-            result = str(res.get("result", "FAIL")).upper()
-            status = "Tested"
+            score = res.get("score")
+            raw_result = res.get("result")
+            result = str(raw_result).upper() if raw_result is not None else ""
+            status = res.get("status", "Tested")
             actual_out = res.get("actual_output", "")
             notes = res.get("notes", "")
 
@@ -96,27 +100,33 @@ class ExcelWriter:
             cell_result.font = FONT_BOLD
 
             # Color coding (1-10 Scale: 8-10 Pass, 5-7 Partial, 1-4 Fail)
-            if result == "PASS" or score >= 8:
+            if result == "PASS" or (score is not None and score >= 8):
                 cell_result.fill = FILL_PASS
-            elif result == "PARTIAL" or score >= 5:
+            elif result == "PARTIAL" or (score is not None and score >= 5):
                 cell_result.fill = FILL_PARTIAL
-            else:
+            elif result == "FAIL" or (score is not None and score < 5):
                 cell_result.fill = FILL_FAIL
+            else:
+                cell_result.fill = PatternFill(fill_type=None)
 
             # Set Actual Output
             cell_actual = ws.cell(r, actual_col, actual_out)
             cell_actual.alignment = ALIGN_LEFT
 
             # Set Score
-            cell_score = ws.cell(r, score_col, score)
-            cell_score.alignment = ALIGN_CENTER
-            cell_score.font = FONT_BOLD
-            if score >= 8:
-                cell_score.fill = FILL_PASS
-            elif score >= 5:
-                cell_score.fill = FILL_PARTIAL
+            if score is not None:
+                cell_score = ws.cell(r, score_col, score)
+                cell_score.alignment = ALIGN_CENTER
+                cell_score.font = FONT_BOLD
+                if score >= 8:
+                    cell_score.fill = FILL_PASS
+                elif score >= 5:
+                    cell_score.fill = FILL_PARTIAL
+                else:
+                    cell_score.fill = FILL_FAIL
             else:
-                cell_score.fill = FILL_FAIL
+                cell_score = ws.cell(r, score_col, "")
+                cell_score.fill = PatternFill(fill_type=None)
 
             # Set Test Notes
             cell_notes = ws.cell(r, notes_col, notes)
@@ -128,6 +138,10 @@ class ExcelWriter:
         ws.column_dimensions[openpyxl.utils.get_column_letter(actual_col)].width = 45
         ws.column_dimensions[openpyxl.utils.get_column_letter(score_col)].width = 14
         ws.column_dimensions[openpyxl.utils.get_column_letter(notes_col)].width = 50
+        if ws.max_column >= 17:
+            ws.column_dimensions[openpyxl.utils.get_column_letter(17)].width = 18
+        if ws.max_column >= 18:
+            ws.column_dimensions[openpyxl.utils.get_column_letter(18)].width = 45
 
         # 1. Save to the single designated run output file
         wb.save(self.run_output_filepath)

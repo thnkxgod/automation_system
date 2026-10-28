@@ -101,7 +101,7 @@ class ChatbotRunner:
             "error_reason": last_error
         }
 
-    def execute_test_case(self, test_case: Dict[str, Any]) -> Dict[str, Any]:
+    def execute_test_case(self, test_case: Dict[str, Any], verbose: bool = True) -> Dict[str, Any]:
         """
         Executes all turns in a test case with a freshly cleared session.
         Waits for previous turn response completely before attempting next.
@@ -113,10 +113,18 @@ class ChatbotRunner:
         final_answer = ""
         total_time = 0.0
         aborted_reason = None
+        is_multi = len(turns) > 1
 
         for turn_idx, query in enumerate(turns):
             if not query:
                 continue
+
+            if is_multi and verbose:
+                q_display = query.replace("\n", " ").strip()
+                if len(q_display) > 80:
+                    q_display = q_display[:80] + "..."
+                print(f"      ↳ [Turn {turn_idx+1}/{len(turns)}] Sending Query : \"{q_display}\"", flush=True)
+
             res = self.send_single_query(query=query, user_id=user_id, session_uuid=session_uuid)
             turn_results.append({
                 "turn": turn_idx + 1,
@@ -129,13 +137,22 @@ class ChatbotRunner:
             final_answer = res["answer"]
             total_time += res["elapsed_seconds"]
 
+            if is_multi and verbose:
+                reply_preview = res["answer"].replace("\n", " ").strip()
+                if len(reply_preview) > 80:
+                    reply_preview = reply_preview[:80] + "..."
+                status_icon = "✓" if res["success"] else "✗"
+                print(f"      ↳ [Turn {turn_idx+1}/{len(turns)}] Received Reply ({res['elapsed_seconds']}s) [{status_icon}]: \"{reply_preview}\"", flush=True)
+
             # If this turn failed or timed out, stop further turns for this scenario
             if not res["success"]:
                 aborted_reason = res.get("error_reason")
+                if is_multi and verbose:
+                    print(f"      ⚠️ [Turn {turn_idx+1}/{len(turns)}] Aborting remaining turns due to error/timeout: {aborted_reason}", flush=True)
                 break
 
             # If multi-turn and succeeded, add brief pause before next turn
-            if len(turns) > 1 and turn_idx < len(turns) - 1:
+            if is_multi and turn_idx < len(turns) - 1:
                 time.sleep(2.0)
 
         # In multi-turn scenarios, summarize conversation in final answer

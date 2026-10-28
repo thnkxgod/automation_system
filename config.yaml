@@ -1,8 +1,8 @@
 system:
   input_dir: "input"
   output_dir: "output"
-  default_file: "chatbot test cases.xlsx"
-  default_sheet: "genral user test cases"
+  default_file: "testing_sheet_with_ai_evaluation_classification.xlsx"
+  default_sheet: "Sheet1"
 
 groq:
   model: "openai/gpt-oss-120b"
@@ -67,9 +67,10 @@ column_synonyms:
     - "expected behavior"
   remark:
     - "remark"
-    - "notes"
+    - "remarks"
+    - "decision"
+    - "approval"
     - "comments"
-    - "tester notes"
   test_status:
     - "test status"
     - "status"
@@ -88,7 +89,26 @@ column_synonyms:
     - "bot response"
   test_notes:
     - "test notes"
+    - "test notes / ai feedback"
+    - "test notes ai feedback"
     - "ai evaluation notes"
+    - "ai feedback"
     - "ai notes"
+    - "notes"
+    - "tester notes"
     - "suggestions / doubts"
+  ai_evaluation:
+    - "ai evaluation"
+    - "ai evaluation?"
+    - "ai eval"
+    - "evaluation type"
+    - "evaluation mode"
+    - "need ai"
+  expected_keywords:
+    - "expected keywords"
+    - "keywords"
+    - "keyword"
+    - "expected keyword"
+    - "manual keywords"
+    - "validation keywords"
 

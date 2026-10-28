@@ -1,7 +1,13 @@
 """
 Master Automation Test Suite Entrypoint.
 Orchestrates Excel ingestion, live Chatbot API execution, Groq AI Judge evaluation, and Excel report generation.
-Evaluates test cases sequentially one-by-one with real-time progress, status filtering, and targeted test ID testing.
+
+Execution Modes:
+- Mode A (Standard): Sequential 1-by-1 execution & immediate evaluation (Current).
+- Mode B (Optimized Batch):
+    Phase 1: Runs all "Don't need AI" test cases first using the CNF Deterministic Keyword Validator (0 LLM hits).
+    Phase 2: Executes and captures all "Need AI" responses, recording them into Excel immediately.
+    Phase 3: Sends captured "Need AI" responses in batches of 10 to Groq LLM simultaneously, saving ~90% of LLM API hits.
 """
 import os
 import sys
@@ -56,7 +62,17 @@ def check_quit_requested() -> bool:
 def is_tested_case(tc: dict) -> bool:
     """Check if test case has already been marked as Tested."""
     status = str(tc.get("status") or "").strip().lower()
-    return "tested" in status and "not tested" not in status and "untested" not in status
+    return "tested" in status and "not tested" not in status and "untested" not in status and "pending" not in status
+
+def is_no_ai(tc: dict) -> bool:
+    """Check if scenario is configured for Deterministic Keyword evaluation."""
+    ai_eval = str(tc.get("ai_evaluation") or tc.get("ai_eval") or tc.get("AI Evaluation?") or "").strip().lower()
+    return "don't need" in ai_eval or "dont need" in ai_eval or "manual" in ai_eval or "no" == ai_eval or "keyword" in ai_eval
+
+def is_rejected_case(tc: dict) -> bool:
+    """Check if scenario Remark is marked as Reject."""
+    remark = str(tc.get("remark") or "").strip().lower()
+    return "reject" in remark
 
 def sync_tested_status(cases, output_dir, sheet_name):
     """Sync status from all recent run output files in output_dir."""
@@ -69,12 +85,29 @@ def sync_tested_status(cases, output_dir, sheet_name):
             wb = openpyxl.load_workbook(rf, data_only=True)
             if sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
+                status_col = None
+                result_col = None
+                for r in range(1, 10):
+                    for c in range(1, ws.max_column + 1):
+                        val = str(ws.cell(r, c).value or "").strip().lower()
+                        if "test status" in val or val == "status":
+                            status_col = c
+                        elif "test result" in val or val == "result":
+                            result_col = c
+                    if status_col:
+                        break
+                if not status_col:
+                    status_col = 12
+
                 for tc in cases:
                     if not is_tested_case(tc):
-                        st = str(ws.cell(tc["row_idx"], 10).value or "").strip()
-                        if "tested" in st.lower() and "not tested" not in st.lower() and "untested" not in st.lower():
+                        s_col = tc.get("header_map", {}).get("test_status") or status_col
+                        r_col = tc.get("header_map", {}).get("test_result") or (s_col + 1 if s_col else 13)
+                        st = str(ws.cell(tc["row_idx"], s_col).value or "").strip()
+                        if "tested" in st.lower() and "not tested" not in st.lower() and "untested" not in st.lower() and "pending" not in st.lower():
                             tc["status"] = st
-                            tc["result"] = str(ws.cell(tc["row_idx"], 11).value or "").strip()
+                            if r_col:
+                                tc["result"] = str(ws.cell(tc["row_idx"], r_col).value or "").strip()
             wb.close()
         except Exception:
             pass
@@ -95,7 +128,7 @@ def main():
     parser = argparse.ArgumentParser(description="Automated Chatbot Testing & Evaluation Engine")
     parser.add_argument("--file", type=str, default=None, help="Name or path of Excel file in input/ folder")
     parser.add_argument("--sheet", type=str, default=None, help="Sheet name to test")
-    parser.add_argument("--test-id", type=str, default=None, help="Run a specific single test case by Test ID (e.g. 1, 12, HR-001, MS-005)")
+    parser.add_argument("--test-id", type=str, default=None, help="Run a specific single test case by Test ID (e.g. 1, 5, 12)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of test cases to run")
     parser.add_argument("--offset", type=int, default=0, help="Offset to start from in parsed test cases")
     parser.add_argument("--pilot", action="store_true", help="Run the first 10 pilot cases")
@@ -103,11 +136,31 @@ def main():
     parser.add_argument("--ui", action="store_true", help="Launch Cypress browser window to watch test scenarios execute live on screen")
     parser.add_argument("--open", action="store_true", help="Open the full interactive Cypress Desktop Application GUI")
     parser.add_argument("--output", type=str, default=None, help="Designated single output Excel file for this run")
-    parser.add_argument("--start-from", type=str, default=None, help="Start testing from a specific query, test ID, or row number (e.g. --start-from 'Which industries do you work with?' or --start-from 35)")
+    parser.add_argument("--start-from", type=str, default=None, help="Start testing from a specific query, test ID, or row number")
     parser.add_argument("--delay", type=float, default=2.0, help="Delay in seconds between test cases (default: 2.0s)")
+    parser.add_argument("--mode", type=str, choices=["A", "B", "a", "b"], default=None, help="Testing Mode: 'A' (Sequential 1-by-1), 'B' (Optimized: No-AI first + Batch AI 10-at-once)")
 
     args = parser.parse_args()
     config, groq_api_key = load_environment_and_config()
+
+    # Determine runtime mode (Mode A vs Mode B)
+    mode = (args.mode or "").strip().upper()
+    if not mode:
+        if not (args.ui or args.open):
+            print("\n" + "=" * 75, flush=True)
+            print("🎯 SELECT TEST EXECUTION MODE:", flush=True)
+            print("  [A] Mode A (Standard)  - Sequential 1-by-1 execution & immediate evaluation", flush=True)
+            print("  [B] Mode B (Optimized) - Run 'Don't need AI' first, then batch 'Need AI' (10 at once)", flush=True)
+            print("=" * 75, flush=True)
+            try:
+                choice = input("Enter choice [A/B] (Press Enter for B - Recommended): ").strip().upper()
+            except Exception:
+                choice = "B"
+            mode = "A" if choice == "A" else "B"
+        else:
+            mode = "B"
+    else:
+        mode = "A" if mode == "A" else "B"
 
     # Determine designated single output file for this entire run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -143,27 +196,35 @@ def main():
 
     # If --open or --ui flag is supplied, delegate execution to Cypress
     if args.ui or args.open:
-        # Check first if target cases are already marked as Tested
-        if not args.force:
-            pre_parser = ExcelParser(config["column_synonyms"])
-            all_pre_cases = pre_parser.parse_sheet(input_path, sheet_name)
-            all_pre_cases = sync_tested_status(all_pre_cases, config["system"]["output_dir"], sheet_name)
-            if args.test_id:
-                t_id = args.test_id.strip().lower()
-                matched = [c for c in all_pre_cases if c["test_id"].strip().lower() == t_id]
-                if not matched:
-                    matched = [c for c in all_pre_cases if t_id in c["test_id"].strip().lower()]
-                if matched and all(is_tested_case(c) for c in matched):
-                    print("=" * 75, flush=True)
-                    print(f"⏭️  [STATUS CHECK] Test ID '{args.test_id}' (Row {matched[0]['row_idx']}) is ALREADY marked as 'Tested'!", flush=True)
-                    print(f"   Skipping. (Pass --force if you want to re-run in UI mode).", flush=True)
-                    print("=" * 75, flush=True)
-                    sys.exit(0)
-            else:
-                untested_pre = [c for c in all_pre_cases if not is_tested_case(c)]
+        pre_parser = ExcelParser(config["column_synonyms"])
+        all_pre_cases = pre_parser.parse_sheet(input_path, sheet_name)
+        all_pre_cases = sync_tested_status(all_pre_cases, config["system"]["output_dir"], sheet_name)
+
+        # Check Remark column first for UI mode
+        if args.test_id:
+            t_id = args.test_id.strip().lower()
+            matched = [c for c in all_pre_cases if c["test_id"].strip().lower() == t_id]
+            if not matched:
+                matched = [c for c in all_pre_cases if t_id in c["test_id"].strip().lower()]
+            if matched and is_rejected_case(matched[0]):
+                print("=" * 75, flush=True)
+                print(f"🚫 [REMARK CHECK] Test ID '{args.test_id}' (Row {matched[0]['row_idx']}) has Remark = 'Reject'!", flush=True)
+                print(f"   Skipping this scenario as requested.", flush=True)
+                print("=" * 75, flush=True)
+                sys.exit(0)
+            if not args.force and matched and all(is_tested_case(c) for c in matched):
+                print("=" * 75, flush=True)
+                print(f"⏭️  [STATUS CHECK] Test ID '{args.test_id}' (Row {matched[0]['row_idx']}) is ALREADY marked as 'Tested'!", flush=True)
+                print(f"   Skipping. (Pass --force if you want to re-run in UI mode).", flush=True)
+                print("=" * 75, flush=True)
+                sys.exit(0)
+        else:
+            active_pre = [c for c in all_pre_cases if not is_rejected_case(c)]
+            if not args.force:
+                untested_pre = [c for c in active_pre if not is_tested_case(c)]
                 if not untested_pre:
                     print("=" * 75, flush=True)
-                    print(f"🎉 [STATUS CHECK] All {len(all_pre_cases)} test cases in '{sheet_name}' are ALREADY marked as 'Tested'!", flush=True)
+                    print(f"🎉 [STATUS CHECK] All {len(active_pre)} active test cases in '{sheet_name}' are ALREADY marked as 'Tested'!", flush=True)
                     print(f"   Nothing to run. (Pass --force to re-test in UI mode).", flush=True)
                     print("=" * 75, flush=True)
                     sys.exit(0)
@@ -183,6 +244,7 @@ def main():
                 print(f"[TARGET] Single Test ID: {args.test_id}", flush=True)
             if args.start_from:
                 print(f"[START] From Scenario : {args.start_from}", flush=True)
+            print(f"[MODE] Selected Mode   : Mode {mode}", flush=True)
             print(f"[OUTPUT] Single Run File: {run_output_path}", flush=True)
             print("=" * 75, flush=True)
             cmd = [cypress_exec, "run", "--headed", "--no-exit", "--spec", "cypress/e2e/chatbot_excel_scenarios.cy.js"]
@@ -200,6 +262,7 @@ def main():
             env_opts.append("limit=10")
         elif args.limit:
             env_opts.append(f"limit={args.limit}")
+        env_opts.append(f"mode={mode}")
 
         if env_opts and not args.open:
             cmd.extend(["--env", ",".join(env_opts)])
@@ -223,6 +286,7 @@ def main():
     print(f"[FILE] Target File   : {input_path}", flush=True)
     print(f"[SHEET] Sheet Name   : {sheet_name}", flush=True)
     print(f"[API] Chatbot API    : {config['api']['chat_endpoint']}", flush=True)
+    print(f"[MODE] Selected Mode : Mode {mode} ({'Optimized Batch' if mode == 'B' else 'Standard Sequential'})", flush=True)
     print(f"[MODEL] Groq Judge   : {config['groq']['model']}", flush=True)
     print("=" * 75, flush=True)
 
@@ -247,7 +311,14 @@ def main():
             print("   Available IDs sample:", [tc["test_id"] for tc in all_cases[:15]], flush=True)
             sys.exit(1)
 
-        # Check first if already tested
+        # Check Remark column FIRST for targeted test ID
+        if is_rejected_case(matched_cases[0]):
+            print("=" * 75, flush=True)
+            print(f"🚫 [REMARK CHECK] Test ID '{args.test_id}' (Row {matched_cases[0]['row_idx']}) has Remark = 'Reject'!", flush=True)
+            print("   Skipping this scenario as requested by user.", flush=True)
+            print("=" * 75, flush=True)
+            sys.exit(0)
+
         if not args.force:
             selected_cases = [tc for tc in matched_cases if not is_tested_case(tc)]
             if not selected_cases:
@@ -266,17 +337,24 @@ def main():
         print(f"🎯 Single Test Case Targeted: Test ID '{selected_cases[0]['test_id']}' (Row {selected_cases[0]['row_idx']})", flush=True)
 
     else:
-        # Check Test Status: filter out all test cases marked as 'Tested' unless --force
+        # Step 1: Check Remark column FIRST and filter out all cases marked as 'reject'
+        rejected_cases = [tc for tc in all_cases if is_rejected_case(tc)]
+        active_cases = [tc for tc in all_cases if not is_rejected_case(tc)]
+        if rejected_cases:
+            rej_ids = [tc["test_id"] for tc in rejected_cases]
+            print(f"🚫 [REMARK CHECK] Skipped {len(rejected_cases)} test case(s) marked as 'Reject' in Remark column: {rej_ids}", flush=True)
+
+        # Step 2: From active cases, filter tested cases unless --force
         if not args.force:
-            untested_cases = [tc for tc in all_cases if not is_tested_case(tc)]
-            skipped_count = total_found - len(untested_cases)
+            untested_cases = [tc for tc in active_cases if not is_tested_case(tc)]
+            skipped_count = len(active_cases) - len(untested_cases)
             if skipped_count > 0:
                 print(f"⏭️  [STATUS CHECK] Skipped {skipped_count} test cases already marked as 'Tested'.", flush=True)
                 print(f"   Remaining pending cases to evaluate: {len(untested_cases)} (Use --force to re-test all)", flush=True)
             candidate_pool = untested_cases
         else:
-            print("🔄 [FORCE MODE] Re-evaluating all cases including previously tested ones.", flush=True)
-            candidate_pool = all_cases
+            print("🔄 [FORCE MODE] Re-evaluating all active cases including previously tested ones.", flush=True)
+            candidate_pool = active_cases
 
         if not candidate_pool:
             print("=" * 75, flush=True)
@@ -301,21 +379,16 @@ def main():
                 candidate_pool = candidate_pool[start_idx:]
             else:
                 print(f"⚠️  [START-FROM] Query or ID '{args.start_from}' not found among untested cases. Starting from top pending case.", flush=True)
-            print("🎉 [STATUS CHECK] All test cases in this sheet are already marked as 'Tested'! Nothing to run.", flush=True)
-            print("   (Pass --force to re-run and re-score them if desired.)", flush=True)
-            print("=" * 75, flush=True)
-            sys.exit(0)
 
-        # Apply pilot or limit
         if args.pilot:
             selected_cases = candidate_pool[:10]
-            print(f"🎯 Pilot Mode Enabled: Running {len(selected_cases)} scenarios one-by-one.", flush=True)
+            print(f"🎯 Pilot Mode Enabled: Running {len(selected_cases)} scenarios.", flush=True)
         elif args.limit:
             selected_cases = candidate_pool[args.offset : args.offset + args.limit]
-            print(f"🎯 Sliced Mode: Running {len(selected_cases)} scenarios (offset={args.offset}) one-by-one.", flush=True)
+            print(f"🎯 Sliced Mode: Running {len(selected_cases)} scenarios (offset={args.offset}).", flush=True)
         else:
             selected_cases = candidate_pool[args.offset :]
-            print(f"🚀 Running {len(selected_cases)} pending test cases one-by-one!", flush=True)
+            print(f"🚀 Running {len(selected_cases)} pending test cases!", flush=True)
 
     # 3. Initialize Runner, Judge, and Writer
     runner = ChatbotRunner(
@@ -341,82 +414,282 @@ def main():
         output_filepath=run_output_path
     )
 
-    # 4. Execute and Evaluate Case by Case
-    evaluated_results = []
-    print("\n" + "-" * 75, flush=True)
-    print(f"[WAIT] Starting Evaluation of {len(selected_cases)} Test Cases (1-by-1)...", flush=True)
-    print(f"[INFO] Single Run Output File : {run_output_path}", flush=True)
-    print(f"💡 CONTROLS: Press 'q' or Ctrl+C at any time to QUIT early and save all tested entries.", flush=True)
-    print("-" * 75, flush=True)
-
     score_counts = {i: 0 for i in range(1, 11)}
     verdict_counts = {"PASS": 0, "PARTIAL": 0, "FAIL": 0}
-
+    evaluated_results = []
     start_total_time = time.time()
     quit_requested = False
 
-    try:
-        for idx, tc in enumerate(selected_cases, 1):
-            if check_quit_requested():
-                quit_requested = True
-                print("\n🛑 [QUIT] 'q' key detected. Stopping test suite gracefully...", flush=True)
-                break
+    # =========================================================================
+    # EXECUTION FLOW: MODE A (Sequential 1-by-1)
+    # =========================================================================
+    if mode == "A":
+        print("\n" + "-" * 75, flush=True)
+        print(f"[MODE A] Starting Sequential Evaluation of {len(selected_cases)} Test Cases (1-by-1)...", flush=True)
+        print(f"[INFO] Single Run Output File : {run_output_path}", flush=True)
+        print(f"💡 CONTROLS: Press 'q' or Ctrl+C at any time to QUIT early and save all tested entries.", flush=True)
+        print("-" * 75, flush=True)
 
-            print(f"\n▶ [{idx}/{len(selected_cases)}] Test ID: {tc['test_id']} (Excel Row {tc['row_idx']})", flush=True)
-            print(f"   Feature   : {tc['feature']}", flush=True)
-            print(f"   Query     : {tc['input_raw'][:75]}", flush=True)
-            print(f"   Expected  : {tc['expected'][:75]}", flush=True)
-
-            # Execute conversation against live API
-            t0 = time.time()
-            exec_res = runner.execute_test_case(tc)
-            run_elapsed = round(time.time() - t0, 2)
-            print(f"   Bot Reply : {exec_res['final_answer'][:80]}... ({run_elapsed}s)", flush=True)
-
-            # Evaluate with Groq Judge
-            eval_res = judge.evaluate(tc, exec_res["display_answer"])
-            score = eval_res["score"]
-            result = eval_res["result"]
-            notes = eval_res["notes"]
-
-            score_counts[score] = score_counts.get(score, 0) + 1
-            verdict_counts[result] = verdict_counts.get(result, 0) + 1
-
-            color_tag = "[PASS]" if result == "PASS" else ("[PARTIAL]" if result == "PARTIAL" else "[FAIL]")
-            print(f"   Verdict   : {color_tag} {result} | Score: {score}/10", flush=True)
-            print(f"   AI Notes  : {notes}", flush=True)
-
-            evaluated_results.append({
-                "row_idx": tc["row_idx"],
-                "test_id": tc["test_id"],
-                "score": score,
-                "result": result,
-                "actual_output": exec_res["display_answer"],
-                "notes": notes,
-                "elapsed_seconds": run_elapsed
-            })
-
-            # Save immediately to the single run file so tested cases are persisted in real time
-            writer.write_results(
-                evaluated_results,
-                sheet_name=sheet_name,
-                update_original=True
-            )
-
-            # Check for quit key during inter-test delay
-            if idx < len(selected_cases):
-                if interruptible_delay(args.delay):
+        try:
+            for idx, tc in enumerate(selected_cases, 1):
+                if check_quit_requested():
                     quit_requested = True
-                    print("\n🛑 [QUIT] 'q' key pressed during delay. Stopping test suite gracefully...", flush=True)
+                    print("\n🛑 [QUIT] 'q' key detected. Stopping test suite gracefully...", flush=True)
                     break
 
-    except KeyboardInterrupt:
-        quit_requested = True
-        print("\n🛑 [QUIT] User interrupted with Ctrl+C. Stopping test suite gracefully...", flush=True)
+                print(f"\n▶ [{idx}/{len(selected_cases)}] Test ID: {tc['test_id']} (Excel Row {tc['row_idx']})", flush=True)
+                print(f"   Feature   : {tc['feature']}", flush=True)
+                print(f"   Eval Mode : {tc.get('ai_evaluation', 'Need AI')}", flush=True)
+                if tc.get('expected_keywords'):
+                    print(f"   Keywords  : {tc['expected_keywords'][:75]}", flush=True)
+                turns_count = len(tc.get("turns", [""]))
+                if turns_count > 1:
+                    print(f"   Multi-Turn: {turns_count} sequential turns detected", flush=True)
+                else:
+                    print(f"   Query     : {tc['input_raw'][:75]}", flush=True)
+                print(f"   Expected  : {tc['expected'][:75]}", flush=True)
+
+                t0 = time.time()
+                exec_res = runner.execute_test_case(tc)
+                run_elapsed = round(time.time() - t0, 2)
+                if turns_count > 1:
+                    print(f"   ✅ [Multi-Turn Done] Captured all {len(exec_res['turn_results'])} turn responses ({run_elapsed}s). Evaluating combined conversation at once...", flush=True)
+                else:
+                    print(f"   Bot Reply : {exec_res['final_answer'][:80]}... ({run_elapsed}s)", flush=True)
+
+                eval_res = judge.evaluate(tc, exec_res["display_answer"])
+                score = eval_res["score"]
+                result = eval_res["result"]
+                notes = eval_res["notes"]
+                engine_used = eval_res.get("model_used", "Groq AI Judge")
+
+                score_counts[score] = score_counts.get(score, 0) + 1
+                verdict_counts[result] = verdict_counts.get(result, 0) + 1
+
+                color_tag = "[PASS]" if result == "PASS" else ("[PARTIAL]" if result == "PARTIAL" else "[FAIL]")
+                print(f"   Verdict   : {color_tag} {result} | Score: {score}/10 | Engine: {engine_used}", flush=True)
+                print(f"   Feedback  : {notes}", flush=True)
+
+                evaluated_results.append({
+                    "row_idx": tc["row_idx"],
+                    "test_id": tc["test_id"],
+                    "score": score,
+                    "result": result,
+                    "status": "Tested",
+                    "actual_output": exec_res["display_answer"],
+                    "notes": notes,
+                    "elapsed_seconds": run_elapsed
+                })
+
+                writer.write_results(evaluated_results, sheet_name=sheet_name, update_original=True)
+
+                if idx < len(selected_cases):
+                    if interruptible_delay(args.delay):
+                        quit_requested = True
+                        print("\n🛑 [QUIT] 'q' key pressed during delay. Stopping test suite gracefully...", flush=True)
+                        break
+
+        except KeyboardInterrupt:
+            quit_requested = True
+            print("\n🛑 [QUIT] User interrupted with Ctrl+C. Stopping test suite gracefully...", flush=True)
+
+    # =========================================================================
+    # EXECUTION FLOW: MODE B (Prioritized No-AI first + Batch AI 10-at-once)
+    # =========================================================================
+    else:
+        no_ai_cases = [c for c in selected_cases if is_no_ai(c)]
+        need_ai_cases = [c for c in selected_cases if not is_no_ai(c)]
+
+        print("\n" + "=" * 75, flush=True)
+        print(f"🚀 [MODE B] OPTIMIZED TWO-PHASE & BATCH EVALUATION PIPELINE", flush=True)
+        print(f"   Phase 1: {len(no_ai_cases)} 'Don't need AI' test cases (Deterministic CNF Validator - 0 LLM hits)", flush=True)
+        print(f"   Phase 2: {len(need_ai_cases)} 'Need AI' test cases (Capturing live responses into Excel)", flush=True)
+        print(f"   Phase 3: Batch AI Evaluation (Evaluating 10 cases at once per Groq LLM API call)", flush=True)
+        print(f"   Single Output File : {run_output_path}", flush=True)
+        print(f"💡 CONTROLS: Press 'q' or Ctrl+C at any time to QUIT early and save all tested entries.", flush=True)
+        print("=" * 75, flush=True)
+
+        try:
+            # -------------------------------------------------------------
+            # PHASE 1: Perform all "Don't need AI" Test Cases First
+            # -------------------------------------------------------------
+            if no_ai_cases:
+                print(f"\n▶ [PHASE 1 START] Evaluating {len(no_ai_cases)} 'Don't need AI' scenarios with CNF Keyword Validator...\n", flush=True)
+                for idx, tc in enumerate(no_ai_cases, 1):
+                    if check_quit_requested():
+                        quit_requested = True
+                        print("\n🛑 [QUIT] 'q' key detected. Stopping test suite gracefully...", flush=True)
+                        break
+
+                    turns_count = len(tc.get("turns", [""]))
+                    print(f"▶ [Phase 1: {idx}/{len(no_ai_cases)}] Test ID: {tc['test_id']} (Excel Row {tc['row_idx']}) - {tc['feature']}", flush=True)
+                    if turns_count > 1:
+                        print(f"   Multi-Turn: {turns_count} sequential turns detected", flush=True)
+                    else:
+                        print(f"   Query     : {tc['input_raw'][:75]}", flush=True)
+                    if tc.get('expected_keywords'):
+                        print(f"   Keywords  : {tc['expected_keywords'][:75]}", flush=True)
+
+                    t0 = time.time()
+                    exec_res = runner.execute_test_case(tc)
+                    run_elapsed = round(time.time() - t0, 2)
+                    if turns_count > 1:
+                        print(f"   ✅ [Multi-Turn Done] Captured all {len(exec_res['turn_results'])} turn responses ({run_elapsed}s). Evaluating combined conversation...", flush=True)
+                    else:
+                        print(f"   Bot Reply : {exec_res['final_answer'][:80]}... ({run_elapsed}s)", flush=True)
+
+                    eval_res = judge.evaluate_keywords(tc, exec_res["display_answer"])
+                    score = eval_res["score"]
+                    result = eval_res["result"]
+                    notes = eval_res["notes"]
+
+                    score_counts[score] = score_counts.get(score, 0) + 1
+                    verdict_counts[result] = verdict_counts.get(result, 0) + 1
+
+                    color_tag = "[PASS]" if result == "PASS" else ("[PARTIAL]" if result == "PARTIAL" else "[FAIL]")
+                    print(f"   Verdict   : {color_tag} {result} | Score: {score}/10 | Zero LLM Hits Used", flush=True)
+                    print(f"   Feedback  : {notes}", flush=True)
+
+                    evaluated_results.append({
+                        "row_idx": tc["row_idx"],
+                        "test_id": tc["test_id"],
+                        "score": score,
+                        "result": result,
+                        "status": "Tested",
+                        "actual_output": exec_res["display_answer"],
+                        "notes": notes,
+                        "elapsed_seconds": run_elapsed
+                    })
+
+                    writer.write_results(evaluated_results, sheet_name=sheet_name, update_original=True)
+
+                    if idx < len(no_ai_cases):
+                        if interruptible_delay(args.delay):
+                            quit_requested = True
+                            print("\n🛑 [QUIT] 'q' key pressed during delay. Stopping test suite gracefully...", flush=True)
+                            break
+
+                print(f"\n✅ [PHASE 1 COMPLETE] Successfully evaluated all {len(no_ai_cases)} 'Don't need AI' cases with 0 LLM hits!", flush=True)
+
+            # -------------------------------------------------------------
+            # PHASE 2: Conversation Capture for all "Need AI" Test Cases
+            # -------------------------------------------------------------
+            captured_ai_items = []
+            if need_ai_cases and not quit_requested:
+                print(f"\n▶ [PHASE 2 START] Querying chatbot to capture responses for {len(need_ai_cases)} 'Need AI' scenarios...\n", flush=True)
+                for idx, tc in enumerate(need_ai_cases, 1):
+                    if check_quit_requested():
+                        quit_requested = True
+                        print("\n🛑 [QUIT] 'q' key detected. Stopping test suite gracefully...", flush=True)
+                        break
+
+                    turns_count = len(tc.get("turns", [""]))
+                    print(f"▶ [Phase 2: {idx}/{len(need_ai_cases)}] Test ID: {tc['test_id']} (Excel Row {tc['row_idx']}) - {tc['feature']}", flush=True)
+                    if turns_count > 1:
+                        print(f"   Multi-Turn: {turns_count} sequential turns detected", flush=True)
+                    else:
+                        print(f"   Query     : {tc['input_raw'][:75]}", flush=True)
+
+                    t0 = time.time()
+                    exec_res = runner.execute_test_case(tc)
+                    run_elapsed = round(time.time() - t0, 2)
+                    if turns_count > 1:
+                        print(f"   ✅ [Multi-Turn Done] Captured all {len(exec_res['turn_results'])} turn responses ({run_elapsed}s). Conversation saved for Phase 3 Batch Eval.", flush=True)
+                    else:
+                        print(f"   Bot Reply : {exec_res['final_answer'][:80]}... ({run_elapsed}s)", flush=True)
+
+                    # Mark in Excel as captured pending AI evaluation
+                    captured_ai_items.append({
+                        "test_case": tc,
+                        "actual_response": exec_res["display_answer"],
+                        "row_idx": tc["row_idx"],
+                        "elapsed": run_elapsed
+                    })
+
+                    # Write intermediate status immediately into Excel
+                    writer.write_results([{
+                        "row_idx": tc["row_idx"],
+                        "test_id": tc["test_id"],
+                        "score": None,
+                        "result": "PENDING",
+                        "status": "Response Captured (Pending AI Eval)",
+                        "actual_output": exec_res["display_answer"],
+                        "notes": "Response captured. Waiting for Phase 3 Batch AI Evaluation."
+                    }], sheet_name=sheet_name, update_original=True)
+
+                    if idx < len(need_ai_cases):
+                        if interruptible_delay(args.delay):
+                            quit_requested = True
+                            print("\n🛑 [QUIT] 'q' key pressed during delay. Stopping test suite gracefully...", flush=True)
+                            break
+
+                print(f"\n✅ [PHASE 2 COMPLETE] Captured {len(captured_ai_items)} chatbot responses in Excel.", flush=True)
+
+            # -------------------------------------------------------------
+            # PHASE 3: Batch AI Evaluation (10 cases at once per Groq LLM API hit)
+            # -------------------------------------------------------------
+            if captured_ai_items:
+                batch_size = 10
+                chunks = [captured_ai_items[i:i + batch_size] for i in range(0, len(captured_ai_items), batch_size)]
+                total_batches = len(chunks)
+
+                print("\n" + "=" * 75, flush=True)
+                print(f"🤖 [PHASE 3 START] Evaluating {len(captured_ai_items)} captured cases in {total_batches} Groq LLM batch calls (10 per hit)...", flush=True)
+                print("=" * 75, flush=True)
+
+                for b_idx, chunk in enumerate(chunks, 1):
+                    if check_quit_requested():
+                        quit_requested = True
+                        print("\n🛑 [QUIT] 'q' key detected. Stopping batch evaluation...", flush=True)
+                        break
+
+                    chunk_ids = [item["test_case"]["test_id"] for item in chunk]
+                    print(f"\n▶ [Batch {b_idx}/{total_batches}] Sending {len(chunk)} scenarios to Groq in 1 API call (IDs: {chunk_ids})...", flush=True)
+
+                    t0_batch = time.time()
+                    batch_eval_results = judge.evaluate_batch(chunk)
+                    batch_time = round(time.time() - t0_batch, 2)
+                    print(f"   Groq Batch Eval completed in {batch_time}s!", flush=True)
+
+                    batch_excel_updates = []
+                    for item, eval_res in zip(chunk, batch_eval_results):
+                        tc = item["test_case"]
+                        score = eval_res["score"]
+                        result = eval_res["result"]
+                        notes = eval_res["notes"]
+                        model_used = eval_res.get("model_used", "Groq AI Judge")
+
+                        score_counts[score] = score_counts.get(score, 0) + 1
+                        verdict_counts[result] = verdict_counts.get(result, 0) + 1
+
+                        color_tag = "[PASS]" if result == "PASS" else ("[PARTIAL]" if result == "PARTIAL" else "[FAIL]")
+                        print(f"   - Test ID {tc['test_id']}: {color_tag} {result} (Score: {score}/10) | {model_used}", flush=True)
+
+                        evaluated_item = {
+                            "row_idx": tc["row_idx"],
+                            "test_id": tc["test_id"],
+                            "score": score,
+                            "result": result,
+                            "status": "Tested",
+                            "actual_output": item["actual_response"],
+                            "notes": notes,
+                            "elapsed_seconds": item["elapsed"]
+                        }
+                        evaluated_results.append(evaluated_item)
+                        batch_excel_updates.append(evaluated_item)
+
+                    # Update Excel with final evaluated scores
+                    writer.write_results(batch_excel_updates, sheet_name=sheet_name, update_original=True)
+
+                print(f"\n🎉 [PHASE 3 COMPLETE] Batch AI evaluation finished successfully!", flush=True)
+
+        except KeyboardInterrupt:
+            quit_requested = True
+            print("\n🛑 [QUIT] User interrupted with Ctrl+C. Stopping test suite gracefully...", flush=True)
 
     total_duration = round(time.time() - start_total_time, 2)
 
-    # 5. Final Write to Excel
+    # Final Output Summary
     if evaluated_results:
         final_out_file = writer.write_results(
             evaluated_results,
@@ -429,11 +702,16 @@ def main():
             print(f"🛑 [QUIT COMPLETED] Automation stopped early by user request.", flush=True)
             print(f"   Saved all {len(evaluated_results)} test cases tested so far into single run file!", flush=True)
         else:
-            print(f"🎉 [COMPLETE] All {len(evaluated_results)} test cases evaluated successfully!", flush=True)
+            print(f"🎉 [COMPLETE] All {len(evaluated_results)} test cases evaluated successfully in Mode {mode}!", flush=True)
         print("=" * 75, flush=True)
         print(f"📁 Output Excel File   : {final_out_file}", flush=True)
         print(f"📊 Scenarios Evaluated : {len(evaluated_results)} / {len(selected_cases)}", flush=True)
         print(f"⏱️  Execution Time      : {total_duration}s", flush=True)
+        if mode == "B":
+            no_ai_count = len([c for c in evaluated_results if is_no_ai(c)])
+            ai_count = len(evaluated_results) - no_ai_count
+            batches_called = (ai_count + 9) // 10 if ai_count > 0 else 0
+            print(f"💡 LLM API Hit Savings : {batches_called} API calls made (saved {max(0, ai_count - batches_called)} calls vs 1-by-1)!", flush=True)
         print(f"Verdicts Breakdown     : PASS={verdict_counts['PASS']}, PARTIAL={verdict_counts['PARTIAL']}, FAIL={verdict_counts['FAIL']}", flush=True)
         print(f"Score Distribution     : 10*={score_counts[10]}, 9*={score_counts[9]}, 8*={score_counts[8]}, 7*={score_counts[7]}, 6*={score_counts[6]}, 5*={score_counts[5]}, 4*={score_counts[4]}, 3*={score_counts[3]}, 2*={score_counts[2]}, 1*={score_counts[1]}", flush=True)
         print("=" * 75 + "\n", flush=True)

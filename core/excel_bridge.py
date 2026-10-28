@@ -22,7 +22,11 @@ def get_parser_and_config():
 
 def is_tested_case(tc):
     status = str(tc.get("status") or "").strip().lower()
-    return "tested" in status and "not tested" not in status and "untested" not in status
+    return "tested" in status and "not tested" not in status and "untested" not in status and "pending" not in status
+
+def is_rejected_case(tc):
+    remark = str(tc.get("remark") or "").strip().lower()
+    return "reject" in remark
 
 def sync_tested_status(cases, output_dir, sheet_name):
     """Sync status from all recent run output files in output_dir."""
@@ -35,12 +39,29 @@ def sync_tested_status(cases, output_dir, sheet_name):
             wb = openpyxl.load_workbook(rf, data_only=True)
             if sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
+                status_col = None
+                result_col = None
+                for r in range(1, 10):
+                    for c in range(1, ws.max_column + 1):
+                        val = str(ws.cell(r, c).value or "").strip().lower()
+                        if "test status" in val or val == "status":
+                            status_col = c
+                        elif "test result" in val or val == "result":
+                            result_col = c
+                    if status_col:
+                        break
+                if not status_col:
+                    status_col = 12
+
                 for tc in cases:
                     if not is_tested_case(tc):
-                        st = str(ws.cell(tc["row_idx"], 10).value or "").strip()
+                        s_col = tc.get("header_map", {}).get("test_status") or status_col
+                        r_col = tc.get("header_map", {}).get("test_result") or (s_col + 1 if s_col else 13)
+                        st = str(ws.cell(tc["row_idx"], s_col).value or "").strip()
                         if "tested" in st.lower() and "not tested" not in st.lower() and "untested" not in st.lower():
                             tc["status"] = st
-                            tc["result"] = str(ws.cell(tc["row_idx"], 11).value or "").strip()
+                            if r_col:
+                                tc["result"] = str(ws.cell(tc["row_idx"], r_col).value or "").strip()
             wb.close()
         except Exception:
             pass
@@ -50,6 +71,9 @@ def fetch_cases(file_path: str, sheet_name: str, test_id: str = None, limit: int
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     parser, config = get_parser_and_config()
     all_cases = parser.parse_sheet(file_path, sheet_name)
+    
+    # Filter out cases marked as 'reject' in Remark column first
+    all_cases = [c for c in all_cases if not is_rejected_case(c)]
     
     # Sync status from latest run output file
     output_dir = os.path.join(root_dir, config["system"]["output_dir"])

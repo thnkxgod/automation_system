@@ -24,14 +24,15 @@ class ExcelParser:
         norm = normalize_header(cell_val)
         if not norm:
             return None
+        # 1. Exact match first across all canonicals
         for canonical, synonyms in self.synonym_map.items():
             if norm in synonyms:
                 return canonical
-        # fallback: check substring if length is short (typical header length <= 30 chars)
-        if len(norm) <= 30:
+        # 2. Substring match fallback only if no exact match found
+        if len(norm) <= 35:
             for canonical, synonyms in self.synonym_map.items():
                 for s in synonyms:
-                    if s == norm or (len(s) >= 4 and s in norm):
+                    if len(s) >= 4 and (s in norm or norm in s):
                         return canonical
         return None
 
@@ -83,6 +84,9 @@ class ExcelParser:
                 status_col = header_map.get("test_status")
                 result_col = header_map.get("test_result")
                 score_col = header_map.get("score")
+                remark_col = header_map.get("remark")
+                ai_eval_col = header_map.get("ai_evaluation")
+                kw_col = header_map.get("expected_keywords")
 
                 raw_input = ws.cell(r, input_col).value if input_col else ""
                 raw_expected = ws.cell(r, expected_col).value if expected_col else ""
@@ -94,6 +98,9 @@ class ExcelParser:
                 raw_status = ws.cell(r, status_col).value if status_col else ""
                 raw_result = ws.cell(r, result_col).value if result_col else ""
                 raw_score = ws.cell(r, score_col).value if score_col else ""
+                raw_remark = ws.cell(r, remark_col).value if remark_col else ""
+                raw_ai_eval = ws.cell(r, ai_eval_col).value if ai_eval_col else "Need AI"
+                raw_kw = ws.cell(r, kw_col).value if kw_col else ""
 
                 # If both input_data and expected are empty, skip row
                 if not str(raw_input or "").strip() and not str(raw_expected or "").strip():
@@ -110,6 +117,12 @@ class ExcelParser:
                         actual_query = str(raw_steps or "").strip()
 
                 turns = self._extract_turns(actual_query)
+                # If raw_input only produced 1 turn, but raw_steps contains multi-turn queries, use raw_steps
+                if len(turns) <= 1 and raw_steps:
+                    steps_turns = self._extract_turns(str(raw_steps))
+                    if len(steps_turns) > 1:
+                        turns = steps_turns
+                        actual_query = str(raw_steps).strip()
 
                 test_cases.append({
                     "row_idx": r,
@@ -125,29 +138,61 @@ class ExcelParser:
                     "input_raw": actual_query,
                     "turns": turns,
                     "expected": str(raw_expected or "").strip(),
+                    "remark": str(raw_remark or "").strip(),
+                    "ai_evaluation": str(raw_ai_eval or "Need AI").strip(),
+                    "expected_keywords": str(raw_kw or "").strip(),
                     "header_map": header_map
                 })
 
         return test_cases
 
+    def _clean_turn_text(self, s: str) -> str:
+        s = s.strip()
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            s = s[1:-1].strip()
+        return s
+
     def _extract_turns(self, input_text: str) -> List[str]:
-        text = input_text.strip()
+        text = str(input_text or "").strip()
         if not text:
             return [""]
 
-        # Check for First: ... Second: ...
-        if re.search(r'\bfirst\s*:', text, re.IGNORECASE) and re.search(r'\bsecond\s*:', text, re.IGNORECASE):
-            parts = re.split(r'\b(?:first|second|third|then)\s*:', text, flags=re.IGNORECASE)
-            turns = [p.strip().strip('"').strip("'") for p in parts if p.strip()]
+        # 1. Pattern: Turn 1: / Turn 1. / Turn 1 - (case-insensitive)
+        if re.search(r'\bturn\s*\d+\s*[:\-\.]', text, re.IGNORECASE):
+            parts = re.split(r'\bturn\s*\d+\s*[:\-\.]\s*', text, flags=re.IGNORECASE)
+            turns = [self._clean_turn_text(p) for p in parts if p.strip()]
             if turns:
                 return turns
 
-        # Check for 1: ... 2: ...
-        if re.search(r'\b1\s*:\s*.+\b2\s*:', text):
-            parts = re.split(r'\b\d+\s*:\s*', text)
-            turns = [p.strip().strip('"').strip("'") for p in parts if p.strip()]
+        # 2. Pattern: Query 1 / Question 1 / Q1 / Step 1 / Prompt 1
+        if re.search(r'\b(?:query|question|q|prompt|step)\s*\d+\s*[:\-\.]', text, re.IGNORECASE):
+            parts = re.split(r'\b(?:query|question|q|prompt|step)\s*\d+\s*[:\-\.]\s*', text, flags=re.IGNORECASE)
+            turns = [self._clean_turn_text(p) for p in parts if p.strip()]
             if turns:
                 return turns
 
-        return [text.strip('"').strip("'")]
+        # 3. Pattern: User: ... User: ...
+        if len(re.findall(r'\buser\s*[:\-]', text, re.IGNORECASE)) > 1:
+            parts = re.split(r'\buser\s*[:\-]\s*', text, flags=re.IGNORECASE)
+            turns = [self._clean_turn_text(p) for p in parts if p.strip()]
+            if turns:
+                return turns
+
+        # 4. Pattern: First: ... Second: ...
+        if re.search(r'\bfirst\s*[:\-\.]', text, re.IGNORECASE) and (re.search(r'\bsecond\s*[:\-\.]', text, re.IGNORECASE) or re.search(r'\bthen\s*[:\-\.]', text, re.IGNORECASE)):
+            parts = re.split(r'\b(?:first|second|third|fourth|fifth|then|finally)\s*[:\-\.]\s*', text, flags=re.IGNORECASE)
+            turns = [self._clean_turn_text(p) for p in parts if p.strip()]
+            if turns:
+                return turns
+
+        # 5. Pattern: Numbered lines: 1: ... 2: ... or 1. ... 2. ... or 1) ... 2) ...
+        if re.search(r'(?:^|\n)\s*1\s*[:\.\)\-]\s*.+(?:^|\n)\s*2\s*[:\.\)\-]', text, re.DOTALL):
+            parts = re.split(r'(?:^|\n)\s*\d+\s*[:\.\)\-]\s*', text)
+            turns = [self._clean_turn_text(p) for p in parts if p.strip()]
+            if len(turns) > 1:
+                return turns
+
+        # 6. Fallback: single turn
+        clean_text = self._clean_turn_text(text)
+        return [clean_text] if clean_text else [""]
 
